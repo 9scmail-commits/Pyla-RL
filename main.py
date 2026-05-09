@@ -36,6 +36,7 @@ from utils import (
     check_version,
     cprint,
     current_wall_model_is_latest,
+    ensure_harvest_workspace,
     extract_text_strings,
     get_brawler_list,
     get_latest_version,
@@ -144,6 +145,11 @@ def pyla_main(data):
             self.last_ignored_prestige_state_time = 0.0
             self.last_ignored_star_drop_state_time = 0.0
             general_config = load_toml_as_dict("cfg/general_config.toml")
+            if _config_bool(general_config.get("harvest_projectiles", "no"), False):
+                ensure_harvest_workspace(
+                    str(general_config.get("harvest_path", "datasets/harvest_workspace")).strip()
+                    or "datasets/harvest_workspace"
+                )
             self.max_ips = parse_max_ips(general_config.get('max_ips', 0))
             self.pause_menu_ips_tracker = _config_bool(
                 general_config.get("pause_menu_ips_tracker", "yes"), True

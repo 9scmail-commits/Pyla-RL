@@ -2,6 +2,7 @@
 import json
 import os
 import random
+from pathlib import Path
 import threading
 import time
 from typing import Optional
@@ -644,6 +645,24 @@ class Play(Movement):
         self.bad_vision_capture_max = int(general_config.get("bad_vision_capture_max", 500))
         self._bad_vision_last_capture = {}
         self._bad_vision_capture_count = 0
+        self._last_harvest_time = 0.0
+        self._harvest_count = 0
+        self.harvest_class_map = ["enemy", "teammate", "player", "projectile", "super"]
+        self._harvest_class_to_id = {n: i for i, n in enumerate(self.harvest_class_map)}
+        self.harvest_enabled = str(general_config.get("harvest_projectiles", "no")).lower() in ("yes", "true", "1")
+        self.harvest_fps = max(0.1, float(general_config.get("harvest_fps", 5.0)))
+        self.harvest_max_images = max(1, int(general_config.get("harvest_max_images", 1000)))
+        self.harvest_path = os.path.normpath(
+            str(general_config.get("harvest_path", "datasets/harvest_workspace")).strip()
+            or "datasets/harvest_workspace"
+        )
+        self._harvest_cap_notice_printed = False
+        try:
+            self._harvest_disk_count = len(list(Path(self.harvest_path).glob("*.png")))
+        except OSError:
+            self._harvest_disk_count = 0
+        if self.harvest_enabled and self._harvest_disk_count >= self.harvest_max_images:
+            self.harvest_enabled = False
         # Fog color (poison gas in showdown) — sampled from images/fog_sample.png.
         # Narrow range because the fog fully overlays whatever is under it.
         self.fog_hsv_low = (50, 95, 215)
@@ -2766,9 +2785,90 @@ class Play(Movement):
         self._rl_prev_motion_centers = new_centers
         return kept_residual, kept_motion
 
+    def _harvest_yolo_data(self, frame, data, main):
+        """Save match frames + YOLO labels for LabelImg (immutable class order)."""
+        if not self.harvest_enabled:
+            return
+        if getattr(main, "state", None) != "match":
+            return
+        if not data:
+            return
+        if self._harvest_disk_count >= self.harvest_max_images:
+            self.harvest_enabled = False
+            if not self._harvest_cap_notice_printed:
+                print(
+                    f"Harvest auto-stop: {self.harvest_path} reached "
+                    f"{self.harvest_max_images} images; harvesting disabled."
+                )
+                self._harvest_cap_notice_printed = True
+            return
+
+        now = time.time()
+        min_interval = 1.0 / self.harvest_fps
+        if now - self._last_harvest_time < min_interval:
+            return
+
+        h, w = frame.shape[:2]
+        if h < 2 or w < 2:
+            return
+
+        try:
+            Path(self.harvest_path).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
+
+        lines = []
+
+        def clip_norm(v):
+            return min(0.999, max(0.001, float(v)))
+
+        for class_name in self.harvest_class_map:
+            class_id = self._harvest_class_to_id[class_name]
+            for box in data.get(class_name) or []:
+                if len(box) < 4:
+                    continue
+                x1, y1, x2, y2 = (float(box[0]), float(box[1]), float(box[2]), float(box[3]))
+                x1 = max(0.0, min(float(w - 1), x1))
+                x2 = max(0.0, min(float(w - 1), x2))
+                y1 = max(0.0, min(float(h - 1), y1))
+                y2 = max(0.0, min(float(h - 1), y2))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                bw = (x2 - x1) / float(w)
+                bh = (y2 - y1) / float(h)
+                cx = ((x1 + x2) * 0.5) / float(w)
+                cy = ((y1 + y2) * 0.5) / float(h)
+                lines.append(
+                    f"{class_id} {clip_norm(cx):.6f} {clip_norm(cy):.6f} "
+                    f"{clip_norm(bw):.6f} {clip_norm(bh):.6f}"
+                )
+
+        stem = f"h_{time.time_ns()}"
+        img_path = Path(self.harvest_path) / f"{stem}.png"
+        lbl_path = Path(self.harvest_path) / f"{stem}.txt"
+        try:
+            cv2.imwrite(str(img_path), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+            lbl_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+        except OSError as exc:
+            print(f"Harvest write failed: {exc}")
+            return
+
+        self._last_harvest_time = now
+        self._harvest_count += 1
+        self._harvest_disk_count += 1
+        if self._harvest_disk_count >= self.harvest_max_images:
+            self.harvest_enabled = False
+            if not self._harvest_cap_notice_printed:
+                print(
+                    f"Harvest auto-stop: {self.harvest_path} reached "
+                    f"{self.harvest_max_images} images; harvesting disabled."
+                )
+                self._harvest_cap_notice_printed = True
+
     def main(self, frame, brawler, main):
         current_time = time.time()
         raw_data = self.get_main_data(frame)
+        self._harvest_yolo_data(frame, raw_data, main)
         data = raw_data
         # Always attach cached walls when this gamemode runs the tile detector; otherwise
         # data['wall'] is missing between refreshes if wall_detection interval > 1s

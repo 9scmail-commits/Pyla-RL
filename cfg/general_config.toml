@@ -37,3 +37,7 @@ mumu_manager_path = ""
 ldplayer_console_path = ""
 api_base_url = "default"
 brawl_stars_package = "com.supercell.brawlstars"
+harvest_projectiles = "no"
+harvest_fps = 5.0
+harvest_max_images = 1000
+harvest_path = "datasets/harvest_workspace"

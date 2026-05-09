@@ -7,7 +7,7 @@ import pyautogui
 from pathlib import Path
 from PIL import Image
 import tkinter as tk
-from utils import load_toml_as_dict, save_dict_as_toml, get_discord_link, get_dpi_scale
+from utils import load_toml_as_dict, save_dict_as_toml, get_discord_link, get_dpi_scale, ensure_harvest_workspace
 from packaging import version
 from performance_profile import apply_performance_profile
 from discord_notifier import async_send_test_notification
@@ -110,6 +110,10 @@ class Hub:
         self.general_config.setdefault("visual_debug_motion_boxes", "no")
         self.general_config.setdefault("capture_bad_vision_frames", "no")
         self.general_config.setdefault("pause_menu_ips_tracker", "yes")
+        self.general_config.setdefault("harvest_projectiles", "no")
+        self.general_config.setdefault("harvest_fps", 5.0)
+        self.general_config.setdefault("harvest_max_images", 1000)
+        self.general_config.setdefault("harvest_path", "datasets/harvest_workspace")
 
         self.webhook_config.setdefault("webhook_url", self.general_config.get("personal_webhook", ""))
         self.webhook_config.setdefault("discord_id", self.general_config.get("discord_id", ""))
@@ -1102,6 +1106,148 @@ class Hub:
             "Adds a live IPS readout (bot iterations per second) and a small green graph to the floating pause window. Takes effect on next bot start."
         )
         row_idx += 1
+
+        harvest_heading = ctk.CTkLabel(
+            container,
+            text="Data harvest (YOLO / LabelImg)",
+            font=theme.ui_font(S(19), "bold"),
+            text_color=theme.TEXT_PRIMARY,
+        )
+        harvest_heading.grid(row=row_idx, column=0, columnspan=2, sticky="w", padx=S(20), pady=(S(16), S(4)))
+        row_idx += 1
+
+        lbl_harvest_en = ctk.CTkLabel(container, text="Enable Harvesting:", font=theme.ui_font(S(18)))
+        lbl_harvest_en.grid(row=row_idx, column=0, sticky="e", padx=S(20), pady=S(10))
+        harvest_en_var = tk.BooleanVar(
+            value=(str(self.general_config["harvest_projectiles"]).lower() in ["yes", "true"])
+        )
+
+        def toggle_harvest_enabled():
+            self.general_config["harvest_projectiles"] = "yes" if harvest_en_var.get() else "no"
+            save_dict_as_toml(self.general_config, self.general_config_path)
+            if harvest_en_var.get():
+                hp = str(self.general_config.get("harvest_path", "datasets/harvest_workspace")).strip()
+                ensure_harvest_workspace(hp or "datasets/harvest_workspace")
+            refresh_harvest_status()
+
+        harvest_en_cb = ctk.CTkCheckBox(
+            container,
+            text="",
+            variable=harvest_en_var,
+            command=toggle_harvest_enabled,
+            width=S(30),
+            height=S(30),
+            **theme.checkbox_kwargs(),
+        )
+        harvest_en_cb.grid(row=row_idx, column=1, sticky="w", padx=S(20), pady=S(10))
+        self.attach_tooltip(
+            harvest_en_cb,
+            "Saves match screenshots and YOLO labels for enemy/teammate/player during matches. Takes effect on next bot start. Open the harvest folder in LabelImg to add projectile boxes."
+        )
+        row_idx += 1
+
+        lbl_harvest_fps = ctk.CTkLabel(container, text="Harvest FPS:", font=theme.ui_font(S(18)))
+        lbl_harvest_fps.grid(row=row_idx, column=0, sticky="e", padx=S(20), pady=S(10))
+
+        harvest_fps_row = ctk.CTkFrame(container, fg_color="transparent")
+        harvest_fps_row.grid(row=row_idx, column=1, padx=S(20), pady=S(10), sticky="w")
+
+        try:
+            harvest_fps_init = float(self.general_config["harvest_fps"])
+        except (TypeError, ValueError):
+            harvest_fps_init = 5.0
+        harvest_fps_init = max(0.5, min(30.0, harvest_fps_init))
+        harvest_fps_var = tk.StringVar(value=f"{harvest_fps_init:.1f}")
+
+        def on_harvest_fps_slider(value):
+            v = float(value)
+            harvest_fps_var.set(f"{v:.1f}")
+            self.general_config["harvest_fps"] = v
+            save_dict_as_toml(self.general_config, self.general_config_path)
+
+        harvest_fps_sld = ctk.CTkSlider(
+            harvest_fps_row,
+            from_=0.5,
+            to=30.0,
+            number_of_steps=295,
+            width=S(220),
+            command=on_harvest_fps_slider,
+            fg_color=theme.INACTIVE,
+            progress_color=theme.ACCENT,
+            button_color=theme.ACCENT,
+            button_hover_color=theme.ACCENT_HOVER,
+        )
+        harvest_fps_sld.pack(side="left", padx=S(5))
+        harvest_fps_sld.set(harvest_fps_init)
+
+        harvest_fps_entry = ctk.CTkEntry(
+            harvest_fps_row,
+            textvariable=harvest_fps_var,
+            width=S(72),
+            font=theme.ui_font(S(16)),
+            **theme.entry_kwargs(),
+        )
+        harvest_fps_entry.pack(side="left", padx=S(10))
+
+        def on_harvest_fps_entry_save(*_):
+            raw = harvest_fps_var.get().strip().replace(",", ".")
+            if raw == "":
+                harvest_fps_var.set(f'{float(self.general_config.get("harvest_fps", 5.0)):.1f}')
+                return
+            try:
+                v = float(raw)
+            except ValueError:
+                harvest_fps_var.set(f'{float(self.general_config.get("harvest_fps", 5.0)):.1f}')
+                return
+            v = max(0.5, min(30.0, v))
+            harvest_fps_var.set(f"{v:.1f}")
+            self.general_config["harvest_fps"] = v
+            save_dict_as_toml(self.general_config, self.general_config_path)
+            harvest_fps_sld.set(v)
+
+        harvest_fps_entry.bind("<FocusOut>", on_harvest_fps_entry_save)
+        harvest_fps_entry.bind("<Return>", on_harvest_fps_entry_save)
+        self.attach_tooltip(harvest_fps_sld, "Maximum harvest saves per second while in a match.")
+        row_idx += 1
+
+        harvest_status_label = ctk.CTkLabel(
+            container,
+            text="",
+            font=theme.ui_font(S(15)),
+            text_color=theme.TEXT_SECONDARY,
+        )
+        harvest_status_label.grid(row=row_idx, column=0, columnspan=2, sticky="w", padx=S(20), pady=(S(4), S(10)))
+        row_idx += 1
+
+        def refresh_harvest_status():
+            hp = str(self.general_config.get("harvest_path", "datasets/harvest_workspace")).strip()
+            harvest_root = Path(hp or "datasets/harvest_workspace")
+            try:
+                n_capture = len(list(harvest_root.glob("*.png")))
+            except OSError:
+                n_capture = 0
+            try:
+                max_im = int(self.general_config.get("harvest_max_images", 1000))
+            except (TypeError, ValueError):
+                max_im = 1000
+            max_im = max(1, max_im)
+            if n_capture >= max_im:
+                harvest_status_label.configure(
+                    text=f"STOPPED — Files Captured: {n_capture} / {max_im}",
+                    text_color=theme.ERROR,
+                )
+            else:
+                harvest_status_label.configure(
+                    text=f"Files Captured: {n_capture} / {max_im}",
+                    text_color=theme.TEXT_SECONDARY,
+                )
+            try:
+                if self.app.winfo_exists():
+                    self.app.after(2000, refresh_harvest_status)
+            except Exception:
+                pass
+
+        refresh_harvest_status()
 
 
         create_labeled_entry(

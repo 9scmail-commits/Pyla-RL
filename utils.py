@@ -3,6 +3,7 @@ import io
 import os
 import re
 import time
+from pathlib import Path
 from io import BytesIO
 import ctypes
 import json
@@ -27,6 +28,17 @@ def _config_bool(value, default=False):
     if value is None:
         return default
     return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+HARVEST_CLASS_NAMES = ["enemy", "teammate", "player", "projectile", "super"]
+
+
+def ensure_harvest_workspace(harvest_path):
+    """Create harvest output directory and LabelImg classes.txt (immutable class order)."""
+    root = Path(harvest_path)
+    root.mkdir(parents=True, exist_ok=True)
+    classes_file = root / "classes.txt"
+    classes_file.write_text("\n".join(HARVEST_CLASS_NAMES) + "\n", encoding="utf-8")
 
 
 def _developer_api_post(session, endpoint, payload, timeout):
