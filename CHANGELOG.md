@@ -3,7 +3,15 @@
 ## Unreleased
 
 ### Added
+- **Projectile tracker backend:** `projectile_tracker_backend` in `cfg/bot_config.toml` selects `bytetrack` (default, requires `supervision`) or `greedy` (legacy matcher).
+- **Intercept HP confirmation:** `intercept_confirm_enabled` plus `intercept_confirm_*` timing keys; RL cross-reference can require predicted impact aligned with an HP drop.
+- **Health monitor:** adaptive HP band search, yellow/shield HSV fill, median smoothing, debounced damage events (`health_bar_min_consecutive_drops`), OCR sanity and `last_hp_status` for debug.
+- Hub controls: **Projectile tracker backend** dropdown and **Intercept HP confirmation** checkbox (Additional Settings).
+- Dependency: `supervision>=0.21` (via `python setup.py --pyla-install`).
 - Pause-window IPS tracker: the floating control window now shows a live `XX.X IPS` readout and a compact green sparkline with a dashed red line at the low-IPS recovery threshold. Toggle it from the hub (`Pause Window IPS Tracker`) or via `pause_menu_ips_tracker` in `cfg/general_config.toml`; default is on.
+
+### Changed
+- **Health monitor:** wider HP crop vs the player box, softer primary HSV gates, relaxed fallback pass, and adaptive minimum pixels for small search strips — fewer false `insufficient_pixels` / `HP?` reads when the bar is visible.
 
 ## v1.1.5 — 2026-04-20
 
