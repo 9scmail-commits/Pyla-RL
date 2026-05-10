@@ -135,6 +135,21 @@ def _numpy_nms(boxes, scores, iou_threshold=0.6):
     return np.array(keep, dtype=np.int32)
 
 
+def _scores_to_probs(raw_scores: np.ndarray) -> np.ndarray:
+    """Convert anchor scores to probabilities for thresholding.
+
+    Ultralytics ONNX exports vary: single-class heads often emit values already
+    in ~[0, 1], while some builds emit raw logits. If any value lies clearly
+    outside [0, 1], treat the vector as logits and apply sigmoid.
+    """
+    raw = raw_scores.astype(np.float64)
+    if raw.size == 0:
+        return raw.astype(np.float32)
+    if raw.min() < -0.05 or raw.max() > 1.01:
+        return (1.0 / (1.0 + np.exp(-np.clip(raw, -80.0, 80.0)))).astype(np.float32)
+    return raw.astype(np.float32)
+
+
 def _postprocess_raw(raw_output, conf_thresh=0.6, iou_thresh=0.6):
     prediction = raw_output[0]
 
@@ -143,11 +158,26 @@ def _postprocess_raw(raw_output, conf_thresh=0.6, iou_thresh=0.6):
         if prediction.shape[0] < prediction.shape[1]:
             prediction = prediction.T
 
-    if prediction.shape[1] <= 6:
+    num_attrs = prediction.shape[1]
+
+    # Ultralytics YOLOv8 ONNX: one row per anchor, layout depends on nc.
+    # - nc==1  -> 5 columns: cx, cy, w, h, score (no separate class index).
+    # - nc>=2  -> 4 + nc columns: cx, cy, w, h, then per-class scores.
+    # Some pipelines export exactly 6 columns as xyxy + obj_conf + class_id.
+    if num_attrs == 6:
         boxes_xyxy = prediction[:, :4]
         confidences = prediction[:, 4]
         class_ids = prediction[:, 5].astype(np.int32)
-    else:
+    elif num_attrs == 5:
+        boxes_cxcywh = prediction[:, :4]
+        confidences = _scores_to_probs(prediction[:, 4])
+        class_ids = np.zeros(prediction.shape[0], dtype=np.int32)
+        x1 = boxes_cxcywh[:, 0] - boxes_cxcywh[:, 2] / 2
+        y1 = boxes_cxcywh[:, 1] - boxes_cxcywh[:, 3] / 2
+        x2 = boxes_cxcywh[:, 0] + boxes_cxcywh[:, 2] / 2
+        y2 = boxes_cxcywh[:, 1] + boxes_cxcywh[:, 3] / 2
+        boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1)
+    elif num_attrs > 6:
         boxes_cxcywh = prediction[:, :4]
         class_scores = prediction[:, 4:]
         class_ids = np.argmax(class_scores, axis=1)
@@ -158,6 +188,8 @@ def _postprocess_raw(raw_output, conf_thresh=0.6, iou_thresh=0.6):
         x2 = boxes_cxcywh[:, 0] + boxes_cxcywh[:, 2] / 2
         y2 = boxes_cxcywh[:, 1] + boxes_cxcywh[:, 3] / 2
         boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1)
+    else:
+        return []
 
     mask = confidences >= conf_thresh
     if not np.any(mask):
