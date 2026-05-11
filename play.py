@@ -76,6 +76,13 @@ class Movement:
         self.wall_box_merge_iou = float(bot_config.get("wall_box_merge_iou", 0.25))
         self.wall_box_merge_center_distance = float(bot_config.get("wall_box_merge_center_distance", 35))
         self.wall_history_min_hits = int(bot_config.get("wall_history_min_hits", 1))
+        self.jump_pad_detection_enabled = str(bot_config.get("jump_pad_detection_enabled", "yes")).lower() in ("yes", "true", "1")
+        self.jump_pad_escape_distance = float(bot_config.get("jump_pad_escape_distance", 620))
+        self.jump_pad_escape_min_distance = float(bot_config.get("jump_pad_escape_min_distance", 55))
+        self.jump_pad_escape_requires_edge = str(bot_config.get("jump_pad_escape_requires_edge", "yes")).lower() in ("yes", "true", "1")
+        self.jump_pad_escape_edge_margin = float(bot_config.get("jump_pad_escape_edge_margin", 0.22))
+        self.jump_pad_escape_teammate_safe_distance = float(bot_config.get("jump_pad_escape_teammate_safe_distance", 360))
+        self.jump_pad_smoke_early_distance = float(bot_config.get("jump_pad_smoke_early_distance", 230))
         self.wall_stuck_state = {
             "last_sample_time": 0.0,
             "last_wall_centers": None,   # np.ndarray (N, 2) of filtered wall centers
@@ -745,6 +752,7 @@ class Play(Movement):
         self.time_since_walls_checked = 0
         self.time_since_movement_change = time.time()
         self.time_since_player_last_found = time.time()
+        self.last_jump_pad_data = []
         self.current_brawler = None
         self.is_hypercharge_ready = False
         self.is_gadget_ready = False
@@ -766,16 +774,23 @@ class Play(Movement):
         self.last_movement_time = time.time()
         self.locked_teammate = None
         self.locked_teammate_distance = float('inf')
-        self.teammate_hysteresis = 0.20  # Switch only if another teammate is 20% closer
+        self.teammate_hysteresis = 0.75  # Switch only if another teammate is dramatically closer
+        self.teammate_lock_max_jump = float(bot_config.get("teammate_lock_max_jump", 320))
+        self.teammate_lock_lost_since = 0.0
         self.trio_grouping_enabled = str(bot_config.get("trio_grouping_enabled", "yes")).lower() in ("yes", "true", "1")
+        self.showdown_playstyle_mode = str(bot_config.get("showdown_playstyle_mode", "follow")).strip().lower()
         self.teammate_follow_min_distance = float(bot_config.get("teammate_follow_min_distance", 180))
         self.teammate_follow_max_distance = float(bot_config.get("teammate_follow_max_distance", 520))
+        self.teammate_follow_step_distance = float(bot_config.get("teammate_follow_step_distance", 8))
         self.teammate_combat_regroup_distance = float(bot_config.get("teammate_combat_regroup_distance", 650))
-        self.teammate_combat_bias = float(bot_config.get("teammate_combat_bias", 0.35))
+        self.teammate_combat_bias = float(bot_config.get("teammate_combat_bias", 0.75))
+        self.teammate_follow_force_direct = str(bot_config.get("teammate_follow_force_direct", "yes")).lower() in ("yes", "true", "1")
+        self.teammate_marker_follow_enabled = str(bot_config.get("teammate_marker_follow_enabled", "yes")).lower() in ("yes", "true", "1")
+        self.teammate_marker_edge_margin = float(bot_config.get("teammate_marker_edge_margin", 0.28))
         self.wall_history = []
         self.wall_history_length = int(bot_config.get("wall_history_length", 3))
         self.scene_data = []
-        self.should_detect_walls = bot_config["gamemode"] in ["brawlball", "brawl_ball", "brawll ball", "showdown"]
+        self.should_detect_walls = bot_config["gamemode"] == "showdown"
         self.is_showdown = bot_config["gamemode"] == "showdown"
         self.minimum_movement_delay = bot_config["minimum_movement_delay"]
         self.no_detection_proceed_delay = time_config["no_detection_proceed"]
@@ -1001,7 +1016,7 @@ class Play(Movement):
                 self.clear_ability_ready("hypercharge")
 
         def use_gadget_wrapper():
-            if self.should_use_gadget:
+            if self.should_use_gadget_on_enemy(brawler, player_data, enemy_data, walls):
                 if self.use_gadget():
                     self.time_since_gadget_checked = time.time()
                     self.clear_ability_ready("gadget")
@@ -1058,7 +1073,32 @@ class Play(Movement):
             "get_horizontal_move_key": self.get_horizontal_move_key,
             "get_vertical_move_key": self.get_vertical_move_key,
             "is_path_blocked": self.is_path_blocked,
+            "is_path_blocked_angle": self.is_path_blocked_angle,
             "is_enemy_hittable": self.is_enemy_hittable,
+            "walls_block_line_of_sight": self.walls_block_line_of_sight,
+            "aimed_attack": self.aimed_attack,
+            "get_distance": self.get_distance,
+            "get_random_movement": lambda: random.choice(["WA", "WD", "SA", "SD", "W", "A", "S", "D"]),
+            "TILE_SIZE": self.TILE_SIZE,
+            "width": brawl_stars_width,
+            "height": brawl_stars_height,
+            "math": math,
+            "angle_from_direction": self.angle_from_direction,
+            "find_best_angle": self.find_best_angle,
+            "blend_angles": self.blend_angles,
+            "lead_shot_angle": self.lead_shot_angle,
+            "track_enemy_velocity": self.track_enemy_velocity,
+            "angle_to_keys": lambda angle: [
+                "D", "SD", "S", "SA", "A", "WA", "W", "WD"
+            ][int((float(angle) % 360 + 22.5) / 45) % 8],
+            "detect_wall_stuck": lambda is_moving: self.detect_wall_stuck(
+                walls,
+                self.get_player_pos(player_data),
+                bool(is_moving),
+                time.time(),
+            ),
+            "start_escape": lambda angle: self.start_semicircle_escape(float(angle), time.time()),
+            "escape_step": lambda: self.semicircle_escape_step(time.time()),
         }
 
         try:
@@ -1227,6 +1267,79 @@ class Play(Movement):
                 closest_teammate = teammate_pos
         return closest_teammate, closest_distance
 
+    def find_teammate_alive_marker(self, frame):
+        """Find the blue off-screen teammate marker used when an alive mate is far away."""
+        if not self.teammate_marker_follow_enabled or frame is None:
+            return None
+
+        h, w = frame.shape[:2]
+        hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
+        blue = cv2.inRange(
+            hsv,
+            np.array((92, 90, 85), dtype=np.uint8),
+            np.array((125, 255, 255), dtype=np.uint8),
+        )
+        blue = cv2.morphologyEx(
+            blue,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)),
+        )
+        contours, _ = cv2.findContours(blue, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        edge_x = max(24, int(w * self.teammate_marker_edge_margin))
+        edge_y = max(24, int(h * self.teammate_marker_edge_margin))
+        scale = max(0.4, min(1.2, w / brawl_stars_width))
+        min_area = max(180, int(500 * scale * scale))
+        max_area = max(min_area + 1, int(50000 * scale * scale))
+        best = None
+
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < min_area or area > max_area:
+                continue
+            x, y, bw, bh = cv2.boundingRect(contour)
+            if bw < 18 * scale or bh < 18 * scale or bw > 240 * scale or bh > 240 * scale:
+                continue
+            cx, cy = x + bw * 0.5, y + bh * 0.5
+            near_edge = cx <= edge_x or cx >= w - edge_x or cy <= edge_y or cy >= h - edge_y
+            if not near_edge:
+                continue
+
+            pad = int(max(bw, bh) * 0.45)
+            x1, y1 = max(0, x - pad), max(0, y - pad)
+            x2, y2 = min(w, x + bw + pad), min(h, y + bh + pad)
+            roi = hsv[y1:y2, x1:x2]
+            if roi.size == 0:
+                continue
+            roi_area = max(1, roi.shape[0] * roi.shape[1])
+            white_ratio = self._count_mask_pixels(roi, (0, 0, 185), (179, 70, 255)) / roi_area
+            blue_ratio = self._count_mask_pixels(roi, (92, 90, 85), (125, 255, 255)) / roi_area
+            if white_ratio < 0.055 or blue_ratio < 0.08:
+                continue
+
+            edge_score = min(cx, w - cx, cy, h - cy)
+            score = (edge_score, -area)
+            if best is None or score < best[0]:
+                best = (score, (cx, cy), (x1, y1, x2, y2))
+
+        if best is None:
+            return None
+        _, marker_pos, marker_box = best
+        vlog(f"teammate marker detected -> pos={tuple(map(int, marker_pos))} box={tuple(map(int, marker_box))}")
+        return marker_pos
+
+    def teammate_marker_follow_angle(self, player_pos):
+        marker_pos = self.find_teammate_alive_marker(self.current_frame)
+        if marker_pos is None or player_pos is None:
+            return None
+        dx = marker_pos[0] - player_pos[0]
+        dy = marker_pos[1] - player_pos[1]
+        if math.hypot(dx, dy) < 8:
+            return None
+        angle = self.angle_from_direction(dx, dy)
+        vlog(f"follow teammate marker -> angle={angle:.1f}°")
+        return angle
+
     def _build_trusted_fog_mask(self, frame, roi_center, roi_radius):
         """Return (mask, (ox, oy)) or None.
 
@@ -1376,6 +1489,79 @@ class Play(Movement):
         angle = self.angle_from_direction(escape_x, escape_y)
         vlog(f"directional fog escape: counts={direction_counts} -> angle={angle:.1f} deg")
         return angle
+
+    def detect_jump_pad_smoke_escape(self, frame, player_position):
+        """Return a softer fog escape angle for jump-pad decisions only.
+
+        Normal fog fleeing stays tight to avoid jitter. This detects smoke a
+        little earlier, but callers only use it when the bot is alone at the
+        map edge and a reachable jump pad exists.
+        """
+        if frame is None or player_position is None:
+            return None
+        r = int(max(self.jump_pad_smoke_early_distance, self.fog_flee_distance))
+        built = self._build_trusted_fog_mask(frame, roi_center=player_position, roi_radius=r)
+        if built is None:
+            return None
+        mask, (ox, oy) = built
+
+        ys, xs = np.nonzero(mask)
+        if xs.size == 0:
+            return None
+
+        px, py = int(player_position[0]), int(player_position[1])
+        dx_all = (xs + ox) - px
+        dy_all = (ys + oy) - py
+        dist_sq = dx_all * dx_all + dy_all * dy_all
+        inside = dist_sq <= r * r
+        count = int(inside.sum())
+        min_pixels = max(20, int(self.fog_min_pixels_in_radius * 0.45))
+        if count < min_pixels:
+            return None
+
+        cx = float(dx_all[inside].mean())
+        cy = float(dy_all[inside].mean())
+        if math.hypot(cx, cy) < 1:
+            return None
+        toward_fog = self.angle_from_direction(cx, cy)
+        flee = self.angle_opposite(toward_fog)
+        vlog(f"jump pad smoke check: {count}px within {r}px -> flee angle={flee:.1f}°")
+        return flee
+
+    def angle_points_into_fog(self, frame, player_position, angle_degrees, lookahead=None):
+        """Return True when moving at angle_degrees would drive into nearby fog.
+
+        This is intentionally stricter than the generic fog threat check: it
+        only rejects the selected movement path, so teammate-following can still
+        work beside smoke without blindly walking toward a teammate inside it.
+        """
+        if frame is None or player_position is None or angle_degrees is None:
+            return False
+        r = int(max(140, lookahead or self.fog_flee_distance * 1.7))
+        built = self._build_trusted_fog_mask(frame, roi_center=player_position, roi_radius=r)
+        if built is None:
+            return False
+        mask, (ox, oy) = built
+
+        import numpy as np
+        ys, xs = np.nonzero(mask)
+        if xs.size == 0:
+            return False
+
+        px, py = player_position
+        dx = (xs + ox) - px
+        dy = (ys + oy) - py
+        ux, uy = self.angle_to_vector(float(angle_degrees))
+        forward = dx * ux + dy * uy
+        lateral = np.abs(dx * uy - dy * ux)
+        corridor_width = max(42, int(r * 0.28))
+        min_pixels = max(18, int(self.fog_min_pixels_in_radius * 0.5))
+        in_path = (forward > 0) & (forward <= r) & (lateral <= corridor_width)
+        count = int(in_path.sum())
+        if count >= min_pixels:
+            vlog(f"fog path guard: {count}px ahead at angle={float(angle_degrees):.1f}°")
+            return True
+        return False
 
     def is_there_poison_gas(self, direction, player_data):
         if self.current_frame is None or player_data is None:
@@ -1600,52 +1786,105 @@ class Play(Movement):
                 closest_teammate = tm_pos
         return closest_teammate, closest_distance
 
+    def choose_locked_teammate(self, player_pos, teammate_data, walls=None):
+        """Keep following the same teammate as long as the detector can track them."""
+        closest_teammate, closest_distance = self.find_closest_teammate(teammate_data, player_pos, walls)
+        if closest_teammate is None:
+            if self.teammate_lock_lost_since <= 0:
+                self.teammate_lock_lost_since = time.time()
+            if time.time() - self.teammate_lock_lost_since > 1.5:
+                self.locked_teammate = None
+                self.locked_teammate_distance = float('inf')
+            return self.locked_teammate, self.locked_teammate_distance
+
+        self.teammate_lock_lost_since = 0.0
+        if self.locked_teammate is None:
+            self.locked_teammate = closest_teammate
+            self.locked_teammate_distance = closest_distance
+            return self.locked_teammate, self.locked_teammate_distance
+
+        candidates = []
+        for teammate in teammate_data or []:
+            teammate_pos = self.get_enemy_pos(teammate)
+            dist_to_lock = self.get_distance(teammate_pos, self.locked_teammate)
+            dist_to_player = self.get_distance(teammate_pos, player_pos)
+            candidates.append((dist_to_lock, dist_to_player, teammate_pos))
+        candidates.sort(key=lambda item: item[0])
+
+        tracked_lock = None
+        tracked_distance = float('inf')
+        if candidates and candidates[0][0] <= self.teammate_lock_max_jump:
+            tracked_lock = candidates[0][2]
+            tracked_distance = candidates[0][1]
+
+        if tracked_lock is None:
+            self.locked_teammate = closest_teammate
+            self.locked_teammate_distance = closest_distance
+            return self.locked_teammate, self.locked_teammate_distance
+
+        switch_distance = tracked_distance * (1.0 - self.teammate_hysteresis)
+        if closest_distance < switch_distance:
+            vlog(
+                "follow teammate: switching lock "
+                f"tracked={int(tracked_distance)}px closest={int(closest_distance)}px"
+            )
+            self.locked_teammate = closest_teammate
+            self.locked_teammate_distance = closest_distance
+        else:
+            self.locked_teammate = tracked_lock
+            self.locked_teammate_distance = tracked_distance
+        return self.locked_teammate, self.locked_teammate_distance
+
     def showdown_follow_teammate(self, player_data, teammate_data, walls):
-        """Keep a useful Trio Showdown spacing around the closest teammate."""
+        """Official Pyla follower behavior adapted to angle movement.
+
+        The newest Pyla follower does not orbit or keep spacing. When no enemy
+        is reachable it simply moves toward the closest teammate, trying the
+        direct diagonal vector first, then the horizontal and vertical parts.
+        """
         player_pos = self.get_player_pos(player_data)
-        closest_teammate, closest_distance = self.get_closest_teammate(player_data, teammate_data)
+        closest_teammate, closest_distance = self.choose_locked_teammate(player_pos, teammate_data, walls)
 
         if closest_teammate is None:
             self.locked_teammate = None
             self.locked_teammate_distance = float('inf')
+            marker_angle = self.teammate_marker_follow_angle(player_pos)
+            if marker_angle is not None:
+                return marker_angle
+            vlog("follow teammate: no teammate detected -> roam")
             return self.showdown_roam(player_data, walls)
 
-        # Hysteresis only applies when there are multiple teammates to choose from.
-        # If we already have a locked target, check whether to switch to a closer one.
-        # Either way, always update the locked target's position to this frame's value.
-        if self.locked_teammate is not None:
-            locked_dist = self.get_distance(self.locked_teammate, player_pos)
-            if closest_distance < locked_dist * (1 - self.teammate_hysteresis):
-                vlog(f"follow teammate: switched target ({int(locked_dist)}px → {int(closest_distance)}px)")
-                self.locked_teammate = closest_teammate
-                self.locked_teammate_distance = closest_distance
-            else:
-                # Same target (or similar) — update its position to the current frame
-                self.locked_teammate = closest_teammate
-                self.locked_teammate_distance = closest_distance
-        else:
-            self.locked_teammate = closest_teammate
-            self.locked_teammate_distance = closest_distance
+        direction_x = closest_teammate[0] - player_pos[0]
+        direction_y = closest_teammate[1] - player_pos[1]
+        direct_angle = self.angle_from_direction(direction_x, direction_y)
 
-        direction_x = self.locked_teammate[0] - player_pos[0]
-        direction_y = self.locked_teammate[1] - player_pos[1]
-        teammate_angle = self.angle_from_direction(direction_x, direction_y)
-        if self.trio_grouping_enabled and closest_distance < self.teammate_follow_min_distance:
-            angle = self.angle_opposite(teammate_angle)
-            action = "space"
-        elif self.trio_grouping_enabled and closest_distance <= self.teammate_follow_max_distance:
-            orbit_side = 1 if (int(time.time() / 2) % 2 == 0) else -1
-            angle = (teammate_angle + 90 * orbit_side) % 360
-            action = "orbit"
-        else:
-            angle = teammate_angle
-            action = "follow"
-        best = self.find_best_angle(player_pos, angle, walls)
-        vlog(f"{action} teammate → angle={best:.1f}° (desired={angle:.1f}°, dist={int(closest_distance)}px, "
-             f"player={int(player_pos[0])},{int(player_pos[1])} tm={int(self.locked_teammate[0])},{int(self.locked_teammate[1])})")
-        return best
+        if self.teammate_follow_force_direct and closest_distance > self.teammate_follow_step_distance:
+            vlog(f"follow teammate: force direct -> angle={direct_angle:.1f}° (dist={int(closest_distance)}px)")
+            return direct_angle
 
-    def get_showdown_movement(self, player_data, enemy_data, teammate_data, walls, brawler):
+        movement_vectors = [(direction_x, direction_y), (direction_x, 0), (0, direction_y)]
+        fallback_angle = direct_angle
+
+        for dx, dy in movement_vectors:
+            if math.hypot(dx, dy) < 1:
+                continue
+            angle = self.angle_from_direction(dx, dy)
+            if fallback_angle is None:
+                fallback_angle = angle
+            if not self.is_path_blocked_angle(player_pos, angle, walls):
+                vlog(f"follow teammate -> angle={angle:.1f}° (dist={int(closest_distance)}px)")
+                return angle
+
+        for angle in (270.0, 180.0, 90.0, 0.0):
+            if not self.is_path_blocked_angle(player_pos, angle, walls):
+                vlog(f"follow teammate: preferred blocked -> fallback angle={angle:.1f}°")
+                return angle
+
+        angle = fallback_angle if fallback_angle is not None else self.showdown_roam(player_data, walls)
+        vlog(f"follow teammate: all paths blocked -> forcing angle={float(angle):.1f}°")
+        return angle
+
+    def get_showdown_movement(self, player_data, enemy_data, teammate_data, walls, brawler, jump_pads=None):
         """Showdown movement using analog joystick angles.
 
         Always returns a float angle in degrees (0–360).
@@ -1664,37 +1903,43 @@ class Play(Movement):
         safe_range, attack_range, super_range = self.get_brawler_range(brawler)
         player_pos = self.get_player_pos(player_data)
 
+        enemy_coords = None
+        enemy_distance = None
+        follow_teammates = self.showdown_playstyle_mode in ("follow", "follower", "team", "teammate", "teammates")
+
         # Fog override is applied uniformly at the end so it works for all
-        # three movement sources (chase/retreat enemy, follow teammate, roam).
-        # Throttled: only actually run the detector once every N calls and
-        # reuse the last decision in between — the fog advances slowly enough
-        # that a few frames of staleness don't matter.
+        # movement sources. In teammate-follow mode this check is deliberately
+        # unthrottled; following a teammate toward smoke is worse than spending
+        # a few extra milliseconds checking the screen.
         self._fog_check_counter += 1
-        if self._fog_check_counter >= self.fog_check_every_n_frames:
+        if follow_teammates or self._fog_check_counter >= self.fog_check_every_n_frames:
             self._fog_threat_cached = self.detect_fog_threat(self.current_frame, player_pos)
             self._fog_direction_escape_cached = self.detect_fog_direction_escape(self.current_frame, player_pos)
             self._fog_check_counter = 0
         fog_flee_angle = self._fog_direction_escape_cached or self._fog_threat_cached
 
-        enemy_coords = None
-        enemy_distance = None
-
         # --- No enemy in sight: follow teammate or roam ---
         if not self.is_there_enemy(enemy_data):
-            if teammate_data:
-                vlog(f"no enemy → follow teammate ({len(teammate_data)} visible)")
+            if follow_teammates and (teammate_data or self.current_frame is not None):
+                if teammate_data:
+                    vlog(f"no enemy → follow teammate ({len(teammate_data)} visible)")
+                else:
+                    vlog("no enemy -> follow teammate marker if visible")
                 angle = self.showdown_follow_teammate(player_data, teammate_data, walls)
             else:
-                vlog("no enemy, no teammate → roam")
+                vlog("no enemy → hide/roam")
                 angle = self.showdown_roam(player_data, walls)
         else:
             enemy_coords, enemy_distance = self.find_closest_enemy(enemy_data, player_pos, walls, "attack")
             if enemy_coords is None:
-                if teammate_data:
-                    vlog("enemy detected but unreachable → follow teammate")
+                if follow_teammates and (teammate_data or self.current_frame is not None):
+                    if teammate_data:
+                        vlog("enemy detected but unreachable → follow teammate")
+                    else:
+                        vlog("enemy detected but unreachable -> follow teammate marker if visible")
                     angle = self.showdown_follow_teammate(player_data, teammate_data, walls)
                 else:
-                    vlog("enemy detected but unreachable, no teammate → roam")
+                    vlog("enemy detected but unreachable → hide/roam")
                     angle = self.showdown_roam(player_data, walls)
             else:
                 # --- Compute exact angle toward/away from enemy, then wall-avoid ---
@@ -1754,25 +1999,57 @@ class Play(Movement):
                     desired = self.apply_combat_dodge(desired, toward_angle, now_t, enemy_distance, safe_range)
                     vlog(f"combat dodge blend -> desired={desired:.1f}°")
 
-                if (self.trio_grouping_enabled and teammate_data and enemy_distance > attack_range):
+                if (follow_teammates and teammate_data and enemy_distance > attack_range):
                     closest_teammate, teammate_distance = self.get_closest_teammate(player_data, teammate_data)
-                    if closest_teammate is not None and teammate_distance > self.teammate_combat_regroup_distance:
+                    if closest_teammate is not None and teammate_distance > self.teammate_follow_step_distance:
                         team_angle = self.angle_from_direction(
                             closest_teammate[0] - player_pos[0],
                             closest_teammate[1] - player_pos[1],
                         )
-                        desired = self.blend_angles(desired, team_angle, self.teammate_combat_bias)
-                        vlog(f"combat regroup bias → desired={desired:.1f}° (team dist={int(teammate_distance)}px)")
+                        team_weight = self.teammate_combat_bias
+                        if self.trio_grouping_enabled and teammate_distance > self.teammate_combat_regroup_distance:
+                            team_weight = max(team_weight, 0.85)
+                        desired = self.blend_angles(desired, team_angle, team_weight)
+                        vlog(f"combat teammate pull -> desired={desired:.1f}° (team dist={int(teammate_distance)}px, weight={team_weight:.2f})")
 
                 angle = self.find_best_angle(player_pos, desired, walls)
                 vlog(f"showdown: movement angle={angle:.1f}° (desired={desired:.1f}°)")
 
+        if (
+                follow_teammates
+                and fog_flee_angle is None
+                and self.angle_points_into_fog(self.current_frame, player_pos, angle)
+        ):
+            fog_flee_angle = self.angle_opposite(angle)
+            vlog(f"showdown: follow path points into fog -> fallback escape={fog_flee_angle:.1f}°")
+
         # --- Fog proximity override ---
         # If trusted fog is close, replace movement with a flee angle. Attack
         # block below still fires independently based on enemy_distance.
-        if fog_flee_angle is not None:
-            angle = self.find_best_angle(player_pos, fog_flee_angle, walls)
-            vlog(f"showdown: fog override → angle={angle:.1f}°")
+        jump_pad_flee_angle = fog_flee_angle
+        if (
+                jump_pad_flee_angle is None
+                and jump_pads
+                and self.jump_pad_detection_enabled
+                and (not self.jump_pad_escape_requires_edge or self.is_player_near_map_edge(player_pos))
+                and not self.has_close_teammate_for_jump_escape(player_pos, teammate_data)
+        ):
+            jump_pad_flee_angle = self.detect_jump_pad_smoke_escape(self.current_frame, player_pos)
+
+        if jump_pad_flee_angle is not None:
+            jump_pad_angle = self.find_jump_pad_escape_angle(
+                player_pos,
+                jump_pads or [],
+                walls,
+                jump_pad_flee_angle,
+                teammate_data=teammate_data,
+            )
+            if jump_pad_angle is not None:
+                angle = jump_pad_angle
+                vlog(f"showdown: fog override -> jump pad angle={angle:.1f}°")
+            elif fog_flee_angle is not None:
+                angle = self.find_best_angle(player_pos, fog_flee_angle, walls)
+                vlog(f"showdown: fog override → angle={angle:.1f}°")
 
         # --- Skills (only when an attackable enemy was found) ---
         if enemy_coords is None:
@@ -1786,16 +2063,10 @@ class Play(Movement):
             enemy_hittable = self.is_enemy_hittable(player_pos, enemy_coords, walls, "attack")
             vlog(f"enemy in attack range (dist={int(enemy_distance)}px, range={attack_range}px), hittable={enemy_hittable}")
             if enemy_hittable:
-                if self.should_use_gadget and self.is_gadget_ready and self.time_since_holding_attack is None:
-                    enemies_in_range = sum(
-                        1 for enemy in (enemy_data or [])
-                        if self.get_distance(self.get_enemy_pos(enemy), player_pos) <= attack_range
-                    )
-                    gadget_threshold = attack_range if enemies_in_range >= 2 else attack_range * 0.7
-                    if enemy_distance <= gadget_threshold:
-                        if self.use_gadget():
-                            self.time_since_gadget_checked = time.time()
-                            self.clear_ability_ready("gadget")
+                if self.should_use_gadget_on_enemy(brawler, player_data, enemy_data, walls):
+                    if self.use_gadget():
+                        self.time_since_gadget_checked = time.time()
+                        self.clear_ability_ready("gadget")
 
                 if not must_brawler_hold_attack:
                     attack_angle = toward_angle
@@ -2023,6 +2294,9 @@ class Play(Movement):
 
         if 'wall' not in data.keys() or not data['wall']:
             data['wall'] = []
+
+        if 'jump_pad' not in data.keys() or not data['jump_pad']:
+            data['jump_pad'] = []
 
         return False if incomplete else data
 
@@ -2303,9 +2577,18 @@ class Play(Movement):
                 teammate_data=data['teammate'],
                 walls=data['wall'],
                 brawler=brawler,
+                jump_pads=data.get('jump_pad') or [],
             )
-            # Debounce small angle jitter before sending to joystick
-            movement = self._debounce_angle(movement)
+            strict_following = (
+                self.showdown_playstyle_mode in ("follow", "follower", "team", "teammate", "teammates")
+                and bool(data.get('teammate'))
+            )
+            if strict_following:
+                self.last_movement = movement
+                self.last_movement_time = time.time()
+            else:
+                # Debounce small angle jitter before sending to joystick.
+                movement = self._debounce_angle(movement)
         else:
             movement = self.get_movement(player_data=data['player'][0], enemy_data=data['enemy'], walls=data['wall'], brawler=brawler)
 
@@ -2402,6 +2685,28 @@ class Play(Movement):
             self.clear_ability_ready("super")
             return True
         return False
+
+    def should_use_gadget_on_enemy(self, brawler, player_data, enemy_data, walls):
+        if not self.should_use_gadget or not self.is_gadget_ready or self.time_since_holding_attack is not None:
+            return False
+        if not enemy_data:
+            return False
+
+        player_pos = self.get_player_pos(player_data)
+        enemy_coords, enemy_distance = self.find_closest_enemy(enemy_data, player_pos, walls, "attack")
+        if enemy_coords is None:
+            return False
+
+        _, attack_range, _ = self.get_brawler_range(brawler)
+        enemies_in_range = sum(
+            1
+            for enemy in (enemy_data or [])
+            if self.get_distance(self.get_enemy_pos(enemy), player_pos) <= attack_range
+        )
+        gadget_threshold = attack_range if enemies_in_range >= 2 else attack_range * 0.7
+        if enemy_distance > gadget_threshold:
+            return False
+        return self.is_enemy_hittable(player_pos, enemy_coords, walls, "attack")
 
     def remember_ability_ready(self, ability_name, detected_ready, current_time):
         seen_attr = f"_{ability_name}_ready_seen_at"
@@ -2575,12 +2880,125 @@ class Play(Movement):
 
         return combined_walls
 
+    @staticmethod
+    def box_center(box):
+        return (box[0] + box[2]) * 0.5, (box[1] + box[3]) * 0.5
+
+    def is_player_near_map_edge(self, player_pos):
+        frame = getattr(self, "current_frame", None)
+        if frame is None or player_pos is None:
+            return False
+        h, w = frame.shape[:2]
+        margin = max(0.05, min(0.45, float(self.jump_pad_escape_edge_margin)))
+        edge_x = w * margin
+        edge_y = h * margin
+        x, y = player_pos
+        return x <= edge_x or x >= w - edge_x or y <= edge_y or y >= h - edge_y
+
+    def has_close_teammate_for_jump_escape(self, player_pos, teammate_data):
+        if player_pos is None:
+            return True
+        for teammate in teammate_data or []:
+            teammate_pos = self.get_enemy_pos(teammate)
+            if self.get_distance(teammate_pos, player_pos) <= self.jump_pad_escape_teammate_safe_distance:
+                return True
+        return False
+
+    def detect_jump_pads(self, frame):
+        """Detect jump pads from their yellow arrow inside a dark gray tile.
+
+        The wall model does not include jump pads, so this uses strict color and
+        shape anchors from the game art. It returns pad boxes in frame coords.
+        """
+        if not self.jump_pad_detection_enabled or frame is None:
+            return []
+
+        hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
+        yellow = cv2.inRange(
+            hsv,
+            np.array((18, 90, 120), dtype=np.uint8),
+            np.array((38, 255, 255), dtype=np.uint8),
+        )
+        yellow = cv2.morphologyEx(
+            yellow,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)),
+        )
+        contours, _ = cv2.findContours(yellow, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        h, w = frame.shape[:2]
+        scale = max(0.4, min(1.2, w / brawl_stars_width))
+        min_area = max(80, int(450 * scale * scale))
+        max_area = max(min_area + 1, int(9000 * scale * scale))
+        pads = []
+
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < min_area or area > max_area:
+                continue
+            x, y, bw, bh = cv2.boundingRect(contour)
+            if bw < 12 * scale or bh < 12 * scale:
+                continue
+            if bw > 160 * scale or bh > 160 * scale:
+                continue
+
+            pad_size = int(max(bw, bh) * 2.4)
+            cx, cy = x + bw * 0.5, y + bh * 0.5
+            rx1 = max(0, int(cx - pad_size * 0.5))
+            ry1 = max(0, int(cy - pad_size * 0.5))
+            rx2 = min(w, int(cx + pad_size * 0.5))
+            ry2 = min(h, int(cy + pad_size * 0.5))
+            roi = hsv[ry1:ry2, rx1:rx2]
+            if roi.size == 0:
+                continue
+
+            yellow_ratio = self._count_mask_pixels(roi, (18, 90, 120), (38, 255, 255)) / max(1, roi.shape[0] * roi.shape[1])
+            gray_ratio = self._count_mask_pixels(roi, (0, 0, 40), (179, 95, 190)) / max(1, roi.shape[0] * roi.shape[1])
+            dark_ratio = self._count_mask_pixels(roi, (0, 0, 0), (179, 255, 95)) / max(1, roi.shape[0] * roi.shape[1])
+            if not (0.035 <= yellow_ratio <= 0.42 and gray_ratio > 0.16 and dark_ratio > 0.10):
+                continue
+
+            pads.append([rx1, ry1, rx2, ry2])
+
+        return self.merge_wall_boxes(pads)
+
+    def find_jump_pad_escape_angle(self, player_pos, jump_pads, walls, fog_flee_angle=None, teammate_data=None):
+        if not jump_pads or player_pos is None:
+            return None
+        if self.jump_pad_escape_requires_edge and not self.is_player_near_map_edge(player_pos):
+            vlog("jump pad escape skipped: player is not near map edge")
+            return None
+        if self.has_close_teammate_for_jump_escape(player_pos, teammate_data):
+            vlog("jump pad escape skipped: teammate is close")
+            return None
+
+        candidates = []
+        for pad in jump_pads:
+            pad_pos = self.box_center(self.normalize_box(pad))
+            distance = self.get_distance(pad_pos, player_pos)
+            if distance < self.jump_pad_escape_min_distance or distance > self.jump_pad_escape_distance:
+                continue
+            angle = self.angle_from_direction(pad_pos[0] - player_pos[0], pad_pos[1] - player_pos[1])
+            if self.is_path_blocked_angle(player_pos, angle, walls, distance=max(40, min(distance, self.TILE_SIZE * 2))):
+                continue
+            fog_alignment = 0.0
+            if fog_flee_angle is not None:
+                fog_alignment = abs((angle - fog_flee_angle + 180) % 360 - 180)
+            candidates.append((fog_alignment, distance, angle, pad_pos))
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        _, distance, angle, pad_pos = candidates[0]
+        vlog(f"jump pad escape -> angle={angle:.1f}° dist={int(distance)}px pad={tuple(map(int, pad_pos))}")
+        return angle
+
     def combine_walls_from_history(self):
         if not self.wall_history:
             return []
         current_walls = self.wall_history[-1]
         historical_walls = [wall for walls in self.wall_history for wall in walls]
-        stable_history = self.merge_wall_boxes(historical_walls, min_hits=max(2, self.wall_history_min_hits))
+        stable_history = self.merge_wall_boxes(historical_walls, min_hits=max(1, self.wall_history_min_hits))
         return self.merge_wall_boxes(current_walls + stable_history)
 
     def get_movement(self, player_data, enemy_data, walls, brawler):
@@ -2669,7 +3087,7 @@ class Play(Movement):
                         safe_range,
                     )
                     movement = self.find_best_angle(player_pos, desired, walls)
-                if self.should_use_gadget == True and self.is_gadget_ready and self.time_since_holding_attack is None:
+                if self.should_use_gadget_on_enemy(brawler, player_data, enemy_data, walls):
                     if self.use_gadget():
                         self.time_since_gadget_checked = time.time()
                         self.clear_ability_ready("gadget")
@@ -3125,11 +3543,15 @@ class Play(Movement):
             if current_time - self.time_since_walls_checked > self.walls_treshold:
                 tile_data = self.get_tile_data(frame)
                 walls = self.process_tile_data(tile_data)
+                jump_pads = self.detect_jump_pads(frame)
                 self.time_since_walls_checked = current_time
                 self.last_walls_data = walls
+                self.last_jump_pad_data = jump_pads
             data["wall"] = self.last_walls_data
+            data["jump_pad"] = self.last_jump_pad_data
         elif self.keep_walls_in_memory:
             data["wall"] = self.last_walls_data
+            data["jump_pad"] = self.last_jump_pad_data
 
         data = self.validate_game_data(data)
         self.track_no_detections(data)

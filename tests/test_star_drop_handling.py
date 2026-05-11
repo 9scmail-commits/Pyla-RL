@@ -1,10 +1,32 @@
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import cv2
 
+from stage_manager import StageManager
 from state_finder import get_in_game_state, get_star_drop_type
+
+
+class DummyDropWindowController:
+    def __init__(self):
+        self._screenshot = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        self.clicks = []
+        self.long_presses = []
+        self.keys_released = []
+
+    def screenshot(self):
+        return self._screenshot
+
+    def click(self, x, y, delay=0):
+        self.clicks.append((x, y, delay))
+
+    def long_press(self, x, y, duration=1.15):
+        self.long_presses.append((x, y, duration))
+
+    def keys_up(self, keys):
+        self.keys_released.append(keys)
 
 
 class StarDropHandlingTests(unittest.TestCase):
@@ -65,6 +87,60 @@ class StarDropHandlingTests(unittest.TestCase):
 
         self.assertEqual(get_star_drop_type(image), "daily_hold")
         self.assertEqual(get_in_game_state(image), "daily_star_drop")
+
+    def test_starr_nova_template_uses_long_press_type(self):
+        image = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        template_path = Path("images/star_drop_types/starr_nova_star_drop.png")
+        template = cv2.imread(str(template_path))
+        self.assertIsNotNone(template)
+
+        x, y, w, h = 790, 350, 350, 350
+        th, tw = template.shape[:2]
+        px = x + (w - tw) // 2
+        py = y + (h - th) // 2
+        image[py:py + th, px:px + tw] = template
+
+        self.assertEqual(get_star_drop_type(image), "starr_nova_hold")
+        self.assertEqual(get_in_game_state(image), "nova_star_drop")
+
+    @patch("stage_manager.time.sleep", return_value=None)
+    @patch("stage_manager.get_star_drop_type", return_value="daily_hold")
+    def test_daily_wins_tap_and_hold_drop_uses_long_clicks(self, *_):
+        manager = object.__new__(StageManager)
+        manager.window_controller = DummyDropWindowController()
+
+        manager.handle_star_drop()
+
+        self.assertEqual(manager.window_controller.clicks, [])
+        self.assertEqual(len(manager.window_controller.long_presses), 2)
+        self.assertTrue(all(press[2] == 1.15 for press in manager.window_controller.long_presses))
+        self.assertEqual(manager.window_controller.keys_released, [list("wasd")])
+
+    @patch("stage_manager.time.sleep", return_value=None)
+    @patch("stage_manager.get_star_drop_type", return_value="starr_nova_hold")
+    def test_starr_nova_drop_uses_long_presses(self, *_):
+        manager = object.__new__(StageManager)
+        manager.window_controller = DummyDropWindowController()
+
+        manager.handle_star_drop()
+
+        self.assertEqual(manager.window_controller.clicks, [])
+        self.assertEqual(len(manager.window_controller.long_presses), 2)
+        self.assertTrue(all(press[2] == 1.15 for press in manager.window_controller.long_presses))
+        self.assertEqual(manager.window_controller.keys_released, [list("wasd")])
+
+    @patch("stage_manager.time.sleep", return_value=None)
+    @patch("stage_manager.get_star_drop_type", return_value="standard")
+    def test_standard_star_drop_uses_five_fast_clicks(self, *_):
+        manager = object.__new__(StageManager)
+        manager.window_controller = DummyDropWindowController()
+
+        manager.handle_star_drop()
+
+        self.assertEqual(len(manager.window_controller.clicks), 5)
+        self.assertEqual(manager.window_controller.long_presses, [])
+        self.assertTrue(all(click[2] == 0.04 for click in manager.window_controller.clicks))
+        self.assertEqual(manager.window_controller.keys_released, [list("wasd")])
 
     def test_exact_standard_template_triggers_standard_star_drop(self):
         image = np.zeros((1080, 1920, 3), dtype=np.uint8)

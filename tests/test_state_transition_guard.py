@@ -96,6 +96,48 @@ class StateTransitionGuardTests(unittest.TestCase):
             "lobby",
         )
 
+    def test_matchmaking_is_only_allowed_after_lobby_or_start_press(self):
+        self.assertEqual(
+            normalize_detected_state(
+                "match_making",
+                previous_state="match",
+                match_launch_pending=False,
+            ),
+            "match",
+        )
+        self.assertEqual(
+            normalize_detected_state(
+                "match_making",
+                previous_state=None,
+                match_launch_pending=False,
+            ),
+            "match",
+        )
+        self.assertEqual(
+            normalize_detected_state(
+                "match_making",
+                previous_state="lobby",
+                match_launch_pending=False,
+            ),
+            "match_making",
+        )
+        self.assertEqual(
+            normalize_detected_state(
+                "match_making",
+                previous_state="match",
+                match_launch_pending=True,
+            ),
+            "match_making",
+        )
+        self.assertEqual(
+            normalize_detected_state(
+                "match_making",
+                previous_state="match_making",
+                match_launch_pending=True,
+            ),
+            "match_making",
+        )
+
     def test_star_drop_is_blocked_unless_previous_state_was_post_match_reward_chain(self):
         for previous_state in ("match", "match_making", "shop", "lobby", None):
             with self.subTest(previous_state=previous_state):
@@ -108,7 +150,7 @@ class StateTransitionGuardTests(unittest.TestCase):
                 )
 
     def test_star_drop_is_allowed_only_from_post_match_reward_chain(self):
-        for previous_state in ("end_1st", "end_2nd", "end_3rd", "end_4th", "trophy_reward", "reward_unlock", "star_drop"):
+        for previous_state in ("end_1st", "end_2nd", "end_3rd", "end_4th", "trophy_reward", "reward_unlock", "star_drop", "nova_star_drop"):
             with self.subTest(previous_state=previous_state):
                 self.assertEqual(
                     normalize_detected_state(
@@ -128,13 +170,14 @@ class StateTransitionGuardTests(unittest.TestCase):
             "end_1st",
         )
 
-    def test_daily_star_drop_can_open_from_match_but_not_after_start_pressed(self):
+    def test_daily_star_drop_is_blocked_in_match_without_post_match_result(self):
         self.assertEqual(
             normalize_detected_state(
                 "daily_star_drop",
                 previous_state="match",
+                match_result_seen=False,
             ),
-            "daily_star_drop",
+            "match",
         )
         self.assertEqual(
             normalize_detected_state(
@@ -143,6 +186,41 @@ class StateTransitionGuardTests(unittest.TestCase):
                 match_launch_pending=True,
             ),
             "match",
+        )
+
+    def test_daily_star_drop_is_allowed_after_post_match_result(self):
+        self.assertEqual(
+            normalize_detected_state(
+                "daily_star_drop",
+                previous_state="end_1st",
+                match_result_seen=True,
+            ),
+            "daily_star_drop",
+        )
+
+    def test_nova_star_drop_is_allowed_after_post_match_result(self):
+        self.assertEqual(
+            normalize_detected_state(
+                "nova_star_drop",
+                previous_state="end_1st",
+                match_result_seen=True,
+            ),
+            "nova_star_drop",
+        )
+        self.assertEqual(
+            normalize_detected_state(
+                "nova_star_drop",
+                previous_state="star_drop",
+            ),
+            "nova_star_drop",
+        )
+        self.assertEqual(
+            normalize_detected_state(
+                "daily_star_drop",
+                previous_state="match",
+                match_result_seen=True,
+            ),
+            "daily_star_drop",
         )
 
     def test_lobby_after_match_depends_on_stable_lobby_state_not_vision_quietness(self):

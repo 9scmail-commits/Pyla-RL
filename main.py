@@ -27,7 +27,13 @@ from lobby_automation import LobbyAutomation
 from play import Play
 from runtime_control import RuntimeControlWindow
 from stage_manager import StageManager
-from state_finder import get_state, get_starr_nova_got_it_button_center, is_starr_nova_info_screen
+from state_finder import (
+    get_state,
+    get_starr_nova_got_it_button_center,
+    get_starr_nova_hub_back_button_center,
+    is_starr_nova_hub_screen,
+    is_starr_nova_info_screen,
+)
 from time_management import TimeManagement
 from utils import (
     _config_bool,
@@ -66,7 +72,7 @@ def parse_max_ips(value):
 
 OUT_OF_MATCH_REWARD_STATES = {"prestige_reward", "trophy_reward"}
 TROPHY_REWARD_FOLLOWUP_STATES = {"reward_unlock"}
-STAR_DROP_STATES = {"star_drop", "daily_star_drop"}
+STAR_DROP_STATES = {"star_drop", "daily_star_drop", "nova_star_drop"}
 MATCH_RESULT_STATES = {
     "end_victory",
     "end_defeat",
@@ -85,14 +91,17 @@ def normalize_detected_state(
         match_launch_pending=False,
         match_result_seen=False,
 ):
-    if detected_state in STAR_DROP_STATES:
-        if detected_state == "daily_star_drop" and not match_launch_pending:
+    if detected_state == "match_making":
+        if previous_state in {"lobby", "match_making"} or match_launch_pending:
             return detected_state
+        return previous_state or "match"
+    if detected_state in STAR_DROP_STATES:
         if (
                 previous_state in MATCH_RESULT_STATES
                 or previous_state in OUT_OF_MATCH_REWARD_STATES
                 or previous_state in TROPHY_REWARD_FOLLOWUP_STATES
                 or previous_state in STAR_DROP_STATES
+                or match_result_seen
         ) and not match_launch_pending:
             return detected_state
         return previous_state or "match"
@@ -533,6 +542,23 @@ def pyla_main(data):
             self.window_controller.click(*button_center, delay=0.08)
             return True
 
+        def handle_starr_nova_hub_screen(self, frame):
+            if self.state not in (None, "lobby", "shop"):
+                return False
+
+            screenshot_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            if not is_starr_nova_hub_screen(screenshot_bgr):
+                return False
+            back_center = get_starr_nova_hub_back_button_center(screenshot_bgr)
+            if back_center is None:
+                return False
+            print("Starr Nova hub screen detected; clicking back.")
+            self.window_controller.keys_up(list("wasd"))
+            self.window_controller.click(*back_center, delay=0.08)
+            self.lobby_entered_at = None
+            self.last_lobby_start_press = time.time()
+            return True
+
         def handle_lobby_watchdog(self, state):
             now = time.time()
             if state != "lobby" or self.in_cooldown:
@@ -614,6 +640,8 @@ def pyla_main(data):
                 self.lobby_seen_since_match = True
                 self.match_launch_pending = False
                 self.reward_chain_seen = False
+            elif state == "match_making":
+                self.match_launch_pending = True
             elif (
                     state in OUT_OF_MATCH_REWARD_STATES
                     or state in STAR_DROP_STATES
@@ -623,6 +651,9 @@ def pyla_main(data):
             return state
 
         def manage_time_tasks(self, frame):
+            if self.handle_starr_nova_hub_screen(frame):
+                return
+
             if self.handle_starr_nova_info_screen(frame):
                 return
 
@@ -886,7 +917,11 @@ def pyla_main(data):
                     time.sleep(0.02)
                     continue
 
-                if self.state == "match" and time.time() < self.match_ready_at:
+                follow_mode_active = (
+                    getattr(self.Play, "showdown_playstyle_mode", "").strip().lower()
+                    in ("follow", "follower", "team", "teammate", "teammates")
+                )
+                if self.state == "match" and time.time() < self.match_ready_at and not follow_mode_active:
                     self.window_controller.keys_up(list("wasd"))
                     time.sleep(0.05)
                     continue

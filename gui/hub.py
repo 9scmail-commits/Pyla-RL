@@ -110,6 +110,20 @@ class Hub:
         self.bot_config.setdefault("rl_use_projectile_features", "yes")
         self.bot_config.setdefault("rl_show_projectile_debug", "yes")
         self.bot_config.setdefault("rl_use_hp_drop_penalty", "no")
+        self.bot_config.setdefault("showdown_playstyle_mode", "hide")
+        self.bot_config.setdefault("teammate_lock_max_jump", 320)
+        self.bot_config.setdefault("teammate_follow_step_distance", 8)
+        self.bot_config.setdefault("teammate_combat_bias", 0.75)
+        self.bot_config.setdefault("teammate_follow_force_direct", "yes")
+        self.bot_config.setdefault("teammate_marker_follow_enabled", "yes")
+        self.bot_config.setdefault("teammate_marker_edge_margin", 0.28)
+        self.bot_config.setdefault("jump_pad_detection_enabled", "yes")
+        self.bot_config.setdefault("jump_pad_escape_distance", 620)
+        self.bot_config.setdefault("jump_pad_escape_min_distance", 55)
+        self.bot_config.setdefault("jump_pad_escape_requires_edge", "yes")
+        self.bot_config.setdefault("jump_pad_escape_edge_margin", 0.22)
+        self.bot_config.setdefault("jump_pad_escape_teammate_safe_distance", 360)
+        self.bot_config.setdefault("jump_pad_smoke_early_distance", 230)
 
         # Time thresholds defaults
         self.time_tresholds.setdefault("state_check", 3)
@@ -1302,6 +1316,43 @@ class Hub:
         self.attach_tooltip(
             debug_screen_cb,
             "Shows a live OpenCV debug window with detected player, teammate, enemy, wall, fog, and range overlays. Takes effect on next bot start."
+        )
+        row_idx += 1
+
+        lbl_showdown_style = ctk.CTkLabel(container, text="Trio Movement Style:", font=theme.ui_font(S(18)))
+        lbl_showdown_style.grid(row=row_idx, column=0, sticky="e", padx=S(20), pady=S(10))
+        style_labels = {
+            "hide": "Hide / avoid enemies",
+            "follow": "Follow teammates",
+        }
+        reverse_style_labels = {label: key for key, label in style_labels.items()}
+        current_style = str(self.bot_config.get("showdown_playstyle_mode", "follow")).strip().lower()
+        if current_style not in style_labels:
+            current_style = "follow"
+            self.bot_config["showdown_playstyle_mode"] = current_style
+            save_dict_as_toml(self.bot_config, self.bot_config_path)
+        style_var = tk.StringVar(value=style_labels.get(current_style, style_labels["follow"]))
+
+        def on_showdown_style_change(choice):
+            self.bot_config["showdown_playstyle_mode"] = reverse_style_labels.get(choice, "follow")
+            save_dict_as_toml(self.bot_config, self.bot_config_path)
+
+        style_menu = ctk.CTkOptionMenu(
+            container,
+            values=list(style_labels.values()),
+            command=on_showdown_style_change,
+            variable=style_var,
+            font=theme.ui_font(S(16)),
+            fg_color="#AA2A2A",
+            button_color="#AA2A2A",
+            button_hover_color="#BB3A3A",
+            width=S(190),
+            height=S(35),
+        )
+        style_menu.grid(row=row_idx, column=1, padx=S(20), pady=S(10), sticky="w")
+        self.attach_tooltip(
+            style_menu,
+            "Hide/avoid enemies keeps the current safer roaming behavior. Follow teammates uses the official Pyla follower behavior when no reachable enemy is visible.",
         )
         row_idx += 1
 
