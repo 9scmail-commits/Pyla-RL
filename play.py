@@ -1,6 +1,7 @@
 ﻿import math
 import json
 import os
+import queue
 import random
 import threading
 import time
@@ -19,6 +20,103 @@ visual_debug = load_toml_as_dict("cfg/general_config.toml").get('visual_debug', 
 def vlog(*args):
     if visual_debug:
         print("[DBG]", *args)
+
+
+_opencv_highgui_available = None
+_opencv_highgui_warned = False
+
+
+def opencv_highgui_available():
+    global _opencv_highgui_available
+    if _opencv_highgui_available is not None:
+        return _opencv_highgui_available
+    try:
+        cv2.namedWindow("__pyla_gui_check__", cv2.WINDOW_NORMAL)
+        cv2.destroyWindow("__pyla_gui_check__")
+        _opencv_highgui_available = True
+    except cv2.error:
+        _opencv_highgui_available = False
+    return _opencv_highgui_available
+
+
+def warn_missing_opencv_highgui_once():
+    global _opencv_highgui_warned
+    if _opencv_highgui_warned:
+        return
+    _opencv_highgui_warned = True
+    print(
+        "Visual debug: OpenCV GUI is unavailable (opencv-python-headless is installed). "
+        "Using fallback window. Fix: pip uninstall opencv-python-headless && "
+        "pip install opencv-python==4.8.0.76"
+    )
+
+
+class TkVisualDebugWindow:
+    """Fallback debug window when opencv-python-headless blocks cv2.imshow."""
+
+    _lock = threading.Lock()
+    _instance = None
+
+    def __init__(self):
+        self._frame_queue = queue.Queue(maxsize=1)
+        self._thread = threading.Thread(
+            target=self._run,
+            name="PylaTkVisualDebug",
+            daemon=True,
+        )
+        self._thread.start()
+
+    @classmethod
+    def instance(cls):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = cls()
+            return cls._instance
+
+    def show(self, rgb_image):
+        while True:
+            try:
+                self._frame_queue.get_nowait()
+            except queue.Empty:
+                break
+        try:
+            self._frame_queue.put_nowait(rgb_image)
+        except queue.Full:
+            pass
+
+    def _run(self):
+        import tkinter as tk
+        from PIL import Image, ImageTk
+
+        root = tk.Tk()
+        root.title("PylaAi-XXZ Visual Debug")
+        root.configure(bg="black")
+        label = tk.Label(root, bg="black")
+        label.pack()
+        photo_ref = {"photo": None}
+
+        def poll():
+            try:
+                img = self._frame_queue.get_nowait()
+                photo_ref["photo"] = ImageTk.PhotoImage(Image.fromarray(img))
+                label.configure(image=photo_ref["photo"])
+            except queue.Empty:
+                pass
+            root.after(33, poll)
+
+        poll()
+        root.mainloop()
+
+
+def show_visual_debug_frame(img):
+    if opencv_highgui_available():
+        cv2.imshow("PylaAi-XXZ Visual Debug", cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        cv2.waitKey(1)
+        return
+    warn_missing_opencv_highgui_once()
+    TkVisualDebugWindow.instance().show(img)
+
+
 super_crop_area = load_toml_as_dict("./cfg/lobby_config.toml")['pixel_counter_crop_area']['super']
 gadget_crop_area = load_toml_as_dict("./cfg/lobby_config.toml")['pixel_counter_crop_area']['gadget']
 hypercharge_crop_area = load_toml_as_dict("./cfg/lobby_config.toml")['pixel_counter_crop_area']['hypercharge']
@@ -4295,8 +4393,7 @@ class Play(Movement):
                 if super_range > 0:
                     cv2.circle(img, center, super_range, (255, 255, 0), 2)  # yellow
 
-        cv2.imshow("PylaAi-XXZ Visual Debug", cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
-        cv2.waitKey(1)
+        show_visual_debug_frame(img)
 
     @staticmethod
     def movement_to_direction(movement):

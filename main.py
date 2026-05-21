@@ -9,6 +9,7 @@ from amd_windows_env import configure_amd_windows
 configure_amd_windows()
 import time
 import traceback
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -25,7 +26,8 @@ from gui.main import App
 from gui.select_brawler import SelectBrawler
 from lobby_automation import LobbyAutomation
 from play import Play
-from runtime_control import RuntimeControlWindow
+from runtime_control import RUNNING, RuntimeControlWindow, is_stop_requested, write_state
+from runtime_metrics import metrics_path_for_pid, write_metrics
 from stage_manager import StageManager
 from state_finder import (
     get_state,
@@ -35,6 +37,7 @@ from state_finder import (
     is_starr_nova_info_screen,
 )
 from time_management import TimeManagement
+from telegram_control import TelegramControlServer
 from utils import (
     _config_bool,
     api_base_url,
@@ -154,9 +157,15 @@ def pyla_main(data):
             self.last_ignored_star_drop_state_time = 0.0
             general_config = load_toml_as_dict("cfg/general_config.toml")
             self.max_ips = parse_max_ips(general_config.get('max_ips', 0))
-            self.pause_menu_ips_tracker = _config_bool(
-                general_config.get("pause_menu_ips_tracker", "yes"), True
+            self.pause_menu_ips_graph = str(
+                general_config.get("pause_menu_ips_graph", "no")
+            ).strip().lower() in ("yes", "true", "1", "on")
+            self.pause_menu_graph_samples = max(
+                30,
+                min(120, int(general_config.get("pause_menu_graph_samples", 45))),
             )
+            self.ips_history = deque(maxlen=self.pause_menu_graph_samples)
+            self.metrics_path = metrics_path_for_pid(os.getpid())
             print(
                 "Performance config:",
                 f"max_ips={self.max_ips if self.max_ips is not None else 'unlimited'}",
@@ -234,17 +243,99 @@ def pyla_main(data):
             self.perf_play_ema = None
             self.perf_feed_fps = 0.0
             self.disconnect_ocr_interval = 6.0
-            self.control_window = RuntimeControlWindow()
+            self.control_window = RuntimeControlWindow(metrics_path=self.metrics_path)
             self.control_window.start()
-            self.discord_control = DiscordControlServer(self.control_window.state_path)
+            self.discord_control = DiscordControlServer(
+                self.control_window.state_path,
+                screenshot_provider=self.window_controller.screenshot,
+                restart_game_callback=self.restart_brawl_stars,
+                restart_scrcpy_callback=self.window_controller.restart_scrcpy_client,
+                restart_emulator_callback=self.window_controller.restart_emulator_profile,
+                press_key_callback=self.discord_press_key,
+                back_callback=self.window_controller.android_back,
+                status_provider=self.telegram_status,
+                start_push_callback=self.discord_start_push,
+                stop_all_callback=self.discord_stop_all,
+            )
             self.discord_control.start()
+            self.telegram_control = TelegramControlServer(
+                self.control_window.state_path,
+                screenshot_provider=self.window_controller.screenshot,
+                restart_game_callback=self.restart_brawl_stars,
+                status_provider=self.telegram_status,
+            )
+            self.telegram_control.start()
             self.was_paused = False
             self.pause_started_at = None
+            self.pending_discord_brawler = None
 
         def initialize_stage_manager(self):
             self.Stage_manager.Trophy_observer.win_streak = data[0]['win_streak']
             self.Stage_manager.Trophy_observer.current_trophies = data[0]['trophies']
             self.Stage_manager.Trophy_observer.current_wins = data[0]['wins'] if data[0]['wins'] != "" else 0
+
+        def telegram_status(self):
+            current = self.Stage_manager.brawlers_pick_data[0] if self.Stage_manager.brawlers_pick_data else {}
+            return {
+                "state": self.state or "unknown",
+                "ips": f"{self.ips_ema:.2f}" if self.ips_ema is not None else "",
+                "feed_fps": f"{self.perf_feed_fps:.2f}",
+                "emulator": getattr(self.window_controller, "selected_emulator", ""),
+                "adb_device": getattr(getattr(self.window_controller, "device", None), "serial", ""),
+                "brawler": current.get("brawler", ""),
+                "target": current.get("push_until", ""),
+            }
+
+        def discord_press_key(self, key):
+            normalized = str(key or "").strip().upper()
+            self.window_controller.press_key(normalized)
+            return True
+
+        def discord_stop_all(self):
+            self.window_controller.keys_up(list("wasd"))
+            self.Play.reset_match_control_state()
+            return "PylaAi-XXZ is stopping. The bot process will exit shortly."
+
+        def discord_start_push(self, brawler: str, target: int | None = None):
+            from discord_control import resolve_brawler_choice
+
+            resolved = resolve_brawler_choice(brawler)
+            if not resolved:
+                return False
+
+            if not self.Stage_manager.brawlers_pick_data:
+                return False
+
+            current = self.Stage_manager.brawlers_pick_data[0]
+            push_until = int(target) if target is not None else int(current.get("push_until", 1000) or 1000)
+            current["brawler"] = resolved
+            current["push_until"] = push_until
+            current["automatically_pick"] = True
+            if "type" not in current or not current.get("type"):
+                current["type"] = "trophies"
+
+            self.Play.current_brawler = resolved
+            write_state(self.control_window.state_path, RUNNING)
+
+            reselect_now = self.state == "lobby"
+            if reselect_now:
+                if self.lobby_automator.select_brawler(resolved):
+                    self.pending_discord_brawler = None
+                    return (
+                        f"Pushing {resolved} (target {push_until}). "
+                        "Brawler reselected in lobby."
+                    )
+                self.pending_discord_brawler = resolved
+                return (
+                    f"Pushing {resolved} (target {push_until}). "
+                    "Could not reselect in lobby yet; will retry when lobby is detected."
+                )
+
+            self.pending_discord_brawler = resolved
+            return (
+                f"Pushing {resolved} (target {push_until}). "
+                "Brawler will be reselected when the bot returns to lobby."
+            )
 
         @staticmethod
         def load_models():
@@ -310,8 +401,6 @@ def pyla_main(data):
             self.low_feed_since = None
             self.slow_feed_recovery_attempts = 0
             self.ips_ema = None
-            if self.pause_menu_ips_tracker:
-                self.control_window.publish_ips(None)
             if recovered:
                 self.low_ips_recovery_attempts = 0
 
@@ -679,6 +768,14 @@ def pyla_main(data):
                 self.Stage_manager.do_state(state, frame_data)
                 if state == "lobby":
                     self.match_launch_pending = True
+                    if self.pending_discord_brawler:
+                        pending = self.pending_discord_brawler
+                        if self.lobby_automator.select_brawler(pending):
+                            self.Play.current_brawler = pending
+                            if self.Stage_manager.brawlers_pick_data:
+                                self.Stage_manager.brawlers_pick_data[0]["brawler"] = pending
+                            print(f"Discord push: reselected brawler {pending} in lobby.")
+                        self.pending_discord_brawler = None
                 self.handle_lobby_watchdog(state)
 
             if self.Time_management.no_detections_check():
@@ -829,6 +926,10 @@ def pyla_main(data):
             s_time = time.time()
             c = 0
             while True:
+                if is_stop_requested(self.control_window.state_path):
+                    print("Remote stop requested; shutting down bot.")
+                    break
+
                 if self.handle_pause_control():
                     s_time = time.time()
                     c = 0
@@ -856,8 +957,16 @@ def pyla_main(data):
                     if elapsed > 0:
                         current_ips = c / elapsed
                         self.ips_ema = current_ips if self.ips_ema is None else (self.ips_ema * 0.75 + current_ips * 0.25)
-                        if self.pause_menu_ips_tracker:
-                            self.control_window.publish_ips(self.ips_ema)
+                        if self.ips_ema is not None:
+                            self.ips_history.append(self.ips_ema)
+                            if self.pause_menu_ips_graph:
+                                write_metrics(
+                                    self.metrics_path,
+                                    self.ips_ema,
+                                    self.perf_feed_fps,
+                                    self.ips_history,
+                                    max_samples=self.pause_menu_graph_samples,
+                                )
                         if not self.visual_debug:
                             print(f"{self.ips_ema:.2f} IPS")
                             if self.recover_low_ips(self.ips_ema):
@@ -943,6 +1052,7 @@ def pyla_main(data):
                         time.sleep(target_period - work_time)
 
             self.discord_control.close()
+            self.telegram_control.close()
             self.control_window.close()
 
     main = Main()

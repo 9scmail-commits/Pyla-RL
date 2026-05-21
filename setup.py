@@ -190,6 +190,12 @@ def setup_pyla():
     force_install(["numpy<2.0.0"], no_deps=True)
     force_install(["adbutils==2.12.0", "av==12.3.0"])
     force_install(["https://github.com/leng-yue/py-scrcpy-client/archive/refs/tags/v0.5.0.zip"], no_deps=True)
+    # easyocr pulls opencv-python-headless, which disables cv2.imshow for Debug Screen.
+    subprocess.run(
+        [sys.executable, "-m", "pip", "uninstall", "-y", "opencv-python-headless"],
+        check=False,
+    )
+    force_install(["opencv-python==4.8.0.76"], no_deps=True)
 
     # the setup completes
     os.system('cls')

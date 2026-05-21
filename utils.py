@@ -2,6 +2,7 @@
 import io
 import os
 import re
+import sys
 import time
 from io import BytesIO
 import ctypes
@@ -21,6 +22,22 @@ DEVELOPER_API_BASE_URL = "https://developer.brawlstars.com/api/"
 _brawl_stars_api_refresh_done = False
 _brawl_stars_api_refresh_signature = None
 _brawler_name_aliases = None
+
+
+def project_root():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def resolve_project_path(file_path):
+    file_path = os.fspath(file_path)
+    if os.path.isabs(file_path):
+        return file_path
+    normalized = file_path.replace("\\", "/")
+    if normalized.startswith("./"):
+        normalized = normalized[2:]
+    return os.path.join(project_root(), normalized)
 
 
 def _config_bool(value, default=False):
